@@ -1,5 +1,7 @@
+import base64
 import os
 import threading
+import time
 
 import requests
 from flask import Flask, request
@@ -10,6 +12,8 @@ SECRET = os.environ["WEBHOOK_SECRET"]
 AI_KEY = os.environ["AI_API_KEY"]
 AI_MODEL = os.environ["AI_MODEL"]
 OPENROUTER = "https://openrouter.ai/api/v1"
+GH_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB = "https://api.github.com"
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 app = Flask(__name__)
@@ -86,6 +90,47 @@ def answer(chat_id, prompt):
         send(chat_id, f"ошибка: {e}")
 
 
+def gh(method, path, **kwargs):
+    return requests.request(
+        method,
+        f"{GITHUB}{path}",
+        headers={
+            "Authorization": f"Bearer {GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        },
+        timeout=20,
+        **kwargs,
+    )
+
+
+def test_repo(chat_id):
+    try:
+        if not GH_TOKEN:
+            raise RuntimeError("GITHUB_TOKEN не задан")
+        r = gh(
+            "POST",
+            "/user/repos",
+            json={"name": "meta-agent-test", "private": True, "auto_init": True},
+        )
+        if not r.ok:
+            raise RuntimeError(f"создание репо: {r.status_code} {r.text[:200]}")
+        repo = r.json()["full_name"]
+        time.sleep(2)
+        r = gh(
+            "PUT",
+            f"/repos/{repo}/contents/hello.txt",
+            json={
+                "message": "add hello.txt",
+                "content": base64.b64encode(b"hello from meta-agent").decode(),
+            },
+        )
+        if not r.ok:
+            raise RuntimeError(f"запись файла: {r.status_code} {r.text[:200]}")
+        send(chat_id, f"готово: https://github.com/{repo}")
+    except Exception as e:
+        send(chat_id, f"ошибка: {e}")
+
+
 @app.get("/")
 def health():
     return "ok"
@@ -103,6 +148,8 @@ def webhook():
     text = msg.get("text") or ""
     if text.startswith("/ask "):
         threading.Thread(target=answer, args=(chat_id, text[5:]), daemon=True).start()
+    elif text == "/test_repo":
+        threading.Thread(target=test_repo, args=(chat_id,), daemon=True).start()
     elif text:
         send(chat_id, f"эхо: {text}")
     return "ok"
