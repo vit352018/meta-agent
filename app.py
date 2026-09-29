@@ -43,7 +43,8 @@ def call_model(model, prompt):
         json={"model": model, "messages": [{"role": "user", "content": prompt}]},
         timeout=45,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"{r.status_code} {r.text[:200]}")
     text = r.json()["choices"][0]["message"]["content"]
     if not text:
         raise ValueError("empty response")
@@ -57,10 +58,11 @@ def free_models():
 
 
 def ask_llm(prompt):
+    errors = []
     try:
         return AI_MODEL, call_model(AI_MODEL, prompt)
     except Exception as e:
-        print(f"{AI_MODEL} failed: {e}")
+        errors.append(f"{AI_MODEL}: {e}")
     tried = 0
     for model in free_models():
         if model == AI_MODEL:
@@ -68,11 +70,12 @@ def ask_llm(prompt):
         try:
             return model, call_model(model, prompt)
         except Exception as e:
-            print(f"{model} failed: {e}")
+            errors.append(f"{model}: {e}")
         tried += 1
         if tried == 3:
             break
-    raise RuntimeError("все модели недоступны")
+    print("\n".join(errors), flush=True)
+    raise RuntimeError("все модели недоступны:\n" + "\n".join(errors))
 
 
 def answer(chat_id, prompt):
