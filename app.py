@@ -14,6 +14,15 @@ AI_MODEL = os.environ["AI_MODEL"]
 OPENROUTER = "https://openrouter.ai/api/v1"
 GH_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB = "https://api.github.com"
+RENDER_KEY = os.environ.get("RENDER_API_KEY")
+RENDER = "https://api.render.com/v1"
+HELLO_APP = (
+    "from flask import Flask\n"
+    "app = Flask(__name__)\n\n\n"
+    '@app.get("/")\n'
+    "def hi():\n"
+    '    return "hello from test bot"\n'
+)
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 app = Flask(__name__)
@@ -131,6 +140,86 @@ def test_repo(chat_id):
         send(chat_id, f"ошибка: {e}")
 
 
+def render_api(method, path, **kwargs):
+    return requests.request(
+        method,
+        f"{RENDER}{path}",
+        headers={"Authorization": f"Bearer {RENDER_KEY}", "Accept": "application/json"},
+        timeout=30,
+        **kwargs,
+    )
+
+
+def checked(r, what):
+    if not r.ok:
+        raise RuntimeError(f"{what}: {r.status_code} {r.text[:200]}")
+    return r.json()
+
+
+def test_deploy(chat_id):
+    try:
+        if not (RENDER_KEY and GH_TOKEN):
+            raise RuntimeError("нужны GITHUB_TOKEN и RENDER_API_KEY")
+        login = checked(gh("GET", "/user"), "github user")["login"]
+        repo = f"{login}/meta-agent-test"
+        for name, content in [("app.py", HELLO_APP), ("requirements.txt", "flask\ngunicorn\n")]:
+            checked(
+                gh(
+                    "PUT",
+                    f"/repos/{repo}/contents/{name}",
+                    json={
+                        "message": f"add {name}",
+                        "content": base64.b64encode(content.encode()).decode(),
+                    },
+                ),
+                f"запись {name}",
+            )
+        owner = checked(render_api("GET", "/owners"), "owners")[0]
+        owner_id = (owner.get("owner") or owner)["id"]
+        created = checked(
+            render_api(
+                "POST",
+                "/services",
+                json={
+                    "type": "web_service",
+                    "name": "meta-agent-test",
+                    "ownerId": owner_id,
+                    "repo": f"https://github.com/{repo}",
+                    "autoDeploy": "no",
+                    "envVars": [{"key": "PYTHON_VERSION", "value": "3.11.9"}],
+                    "serviceDetails": {
+                        "runtime": "python",
+                        "plan": "free",
+                        "region": "oregon",
+                        "envSpecificDetails": {
+                            "buildCommand": "pip install -r requirements.txt",
+                            "startCommand": "gunicorn app:app",
+                        },
+                    },
+                },
+            ),
+            "создание сервиса",
+        )
+        service = created["service"]
+        url = service["serviceDetails"]["url"]
+        send(chat_id, f"сервис создан, жду деплой: {url}")
+        final = ("live", "build_failed", "update_failed", "canceled", "pre_deploy_failed", "deactivated")
+        status = None
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            time.sleep(10)
+            deploy = checked(
+                render_api("GET", f"/services/{service['id']}/deploys/{created['deployId']}"),
+                "статус деплоя",
+            )
+            status = deploy["status"]
+            if status in final:
+                break
+        send(chat_id, f"статус деплоя: {status}\n{url}")
+    except Exception as e:
+        send(chat_id, f"ошибка: {e}")
+
+
 @app.get("/")
 def health():
     return "ok"
@@ -150,6 +239,8 @@ def webhook():
         threading.Thread(target=answer, args=(chat_id, text[5:]), daemon=True).start()
     elif text == "/test_repo":
         threading.Thread(target=test_repo, args=(chat_id,), daemon=True).start()
+    elif text == "/test_deploy":
+        threading.Thread(target=test_deploy, args=(chat_id,), daemon=True).start()
     elif text:
         send(chat_id, f"эхо: {text}")
     return "ok"
