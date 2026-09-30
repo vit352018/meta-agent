@@ -49,6 +49,9 @@ BTN_CANCEL = "Отмена"
 MENU = [[BTN_OWN], [BTN_NEW], [BTN_ASK]]
 CANCEL = [[BTN_CANCEL]]
 state = {"step": None}
+last_update = {"id": 0}
+TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
+CHUNK_WINDOW = 10  # seconds: Telegram splits long texts into several messages
 
 
 def send(chat_id, text, keyboard=None):
@@ -359,7 +362,7 @@ def handle(chat_id, message_id, text):
         state["step"] = "ask"
         send(chat_id, "Что спросить у LLM?", CANCEL)
     elif step == "spec" and text:
-        state.update(step="bot_token", spec=text)
+        state.update(step="bot_token", spec=text, spec_at=time.time())
         send(
             chat_id,
             "Теперь токен бота: создайте нового в @BotFather и пришлите токен. "
@@ -367,23 +370,28 @@ def handle(chat_id, message_id, text):
             CANCEL,
         )
     elif step == "bot_token" and text:
-        delete_message(chat_id, message_id)
-        username = check_bot_token(text.strip())
-        if not username:
-            send(chat_id, "Telegram не принял токен. Проверьте и пришлите ещё раз.", CANCEL)
+        token = text.strip()
+        if not TOKEN_RE.match(token) and time.time() - state["spec_at"] < CHUNK_WINDOW:
+            state["spec"] += "\n" + text
+            state["spec_at"] = time.time()
         else:
-            state.update(bot_token=text.strip(), username=username)
-            if state.get("mode") == "own":
-                launch(chat_id)
+            delete_message(chat_id, message_id)
+            username = check_bot_token(token)
+            if not username:
+                send(chat_id, "Telegram не принял токен. Проверьте и пришлите ещё раз.", CANCEL)
             else:
-                state["step"] = "gh_token"
-                send(
-                    chat_id,
-                    f"@{username} принят. Теперь токен GitHub того аккаунта, куда положить код бота. "
-                    "Создать: github.com/settings/tokens?type=beta, доступ All repositories, "
-                    "права Contents и Administration: Read and write. Сообщение удалю.",
-                    CANCEL,
-                )
+                state.update(bot_token=token, username=username)
+                if state.get("mode") == "own":
+                    launch(chat_id)
+                else:
+                    state["step"] = "gh_token"
+                    send(
+                        chat_id,
+                        f"@{username} принят. Теперь токен GitHub того аккаунта, куда положить код бота. "
+                        "Создать: github.com/settings/tokens?type=beta, доступ All repositories, "
+                        "права Contents и Administration: Read and write. Сообщение удалю.",
+                        CANCEL,
+                    )
     elif step == "gh_token" and text:
         delete_message(chat_id, message_id)
         login = check_github(text.strip())
@@ -427,7 +435,12 @@ def handle(chat_id, message_id, text):
 def webhook():
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
         return "forbidden", 403
-    msg = (request.get_json(silent=True) or {}).get("message") or {}
+    update = request.get_json(silent=True) or {}
+    uid = update.get("update_id", 0)
+    if uid <= last_update["id"]:
+        return "ok"
+    last_update["id"] = uid
+    msg = update.get("message") or {}
     chat_id = msg.get("chat", {}).get("id")
     if chat_id != OWNER:
         print(f"ignored message from chat {chat_id}", flush=True)
