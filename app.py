@@ -8,6 +8,8 @@ import time
 
 import requests
 from flask import Flask, request
+from google.auth.transport.requests import AuthorizedSession
+from google.oauth2 import service_account
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 OWNER = int(os.environ["OWNER_CHAT_ID"])
@@ -23,6 +25,8 @@ RENDER_GH_NOTE = (
     "Важно: Render-аккаунт должен быть связан с GitHub-аккаунтом бота и иметь доступ "
     "ко всем репозиториям (All repositories), иначе Render не увидит приватный репозиторий."
 )
+SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API = f"https://api.telegram.org/bot{TOKEN}"
 
@@ -46,8 +50,26 @@ BTN_OWN = "🙋 Бот для меня"
 BTN_NEW = "🤖 Создать бота"
 BTN_ASK = "💬 Спросить LLM"
 BTN_CANCEL = "Отмена"
+BTN_PRIVATE = "Только мне"
+BTN_PUBLIC = "Всем"
+BTN_SHEETS = "📊 Google Таблица"
+BTN_NOINT = "Без интеграций"
 MENU = [[BTN_OWN], [BTN_NEW], [BTN_ASK]]
 CANCEL = [[BTN_CANCEL]]
+AUDIENCE = [[BTN_PRIVATE, BTN_PUBLIC], [BTN_CANCEL]]
+INTEGRATIONS = [[BTN_SHEETS], [BTN_NOINT], [BTN_CANCEL]]
+TOKEN_PROMPT = (
+    "Теперь токен бота: создайте нового в @BotFather и пришлите токен. "
+    "Сообщение с токеном я удалю."
+)
+SHEETS_HELP = (
+    "Google Таблица. Нужен ключ сервисного аккаунта:\n"
+    "1. console.cloud.google.com → создайте проект (или выберите существующий).\n"
+    "2. APIs & Services → Library → Google Sheets API → Enable.\n"
+    "3. IAM & Admin → Service Accounts → Create service account (роли не нужны).\n"
+    "4. Откройте созданный аккаунт → Keys → Add key → Create new key → JSON. Файл скачается.\n"
+    "5. Откройте файл, скопируйте всё содержимое и пришлите сюда. Сообщение удалю."
+)
 state = {"step": None}
 last_update = {"id": 0}
 TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
@@ -232,10 +254,12 @@ def make_spec(spec):
     return f"{slug}-{secrets.token_hex(2)}", prompt
 
 
-def new_bot(chat_id, spec, bot_token, username, gh_token, render_key, ai_key):
+def new_bot(chat_id, spec, bot_token, username, gh_token, render_key, ai_key, extra_env):
     try:
         send(chat_id, f"все данные приняты (@{username}), собираю бота...")
         name, prompt = make_spec(spec)
+        if "SHEET_ID" in extra_env:
+            prompt += "\n\nВ ходе диалога вежливо выясни имя клиента и номер его телефона."
         created_repo = checked(
             gh(gh_token, "POST", "/user/repos", json={"name": name, "private": True, "auto_init": True}),
             "создание репо",
@@ -258,6 +282,7 @@ def new_bot(chat_id, spec, bot_token, username, gh_token, render_key, ai_key):
                 "WEBHOOK_SECRET": secrets.token_hex(16),
                 "AI_API_KEY": ai_key,
                 "AI_MODEL": AI_MODEL,
+                **extra_env,
             },
         )
         send(chat_id, f"сервис {name} создан, жду деплой...")
@@ -266,6 +291,8 @@ def new_bot(chat_id, spec, bot_token, username, gh_token, render_key, ai_key):
             f"статус деплоя: {status}\nбот: @{username}\n"
             f"репо: https://github.com/{repo}\nсервис: {created['service']['serviceDetails']['url']}"
         )
+        if "SHEET_ID" in extra_env:
+            report += f"\nтаблица: https://docs.google.com/spreadsheets/d/{extra_env['SHEET_ID']}"
         if status != "live":
             report += "\n\n" + RENDER_GH_NOTE
         send(chat_id, report, MENU)
@@ -314,9 +341,68 @@ def check_openrouter(key):
         return False
 
 
+def parse_sa(text):
+    try:
+        info = json.loads(text)
+        if info.get("type") != "service_account" or not info.get("private_key") or not info.get("client_email"):
+            return None
+        return json.dumps(info, separators=(",", ":")), info["client_email"]
+    except Exception:
+        return None
+
+
+def parse_sheet_id(text):
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", text)
+    return m.group(1) if m else text.strip()
+
+
+def sheet_error(r, email):
+    if r.status_code == 404:
+        return "Таблица не найдена. Проверьте ссылку и пришлите её ещё раз."
+    if r.status_code == 403:
+        if "SERVICE_DISABLED" in r.text or "has not been used" in r.text:
+            return (
+                "Google Sheets API не включён в проекте: APIs & Services → Library → "
+                "Google Sheets API → Enable. Затем пришлите ссылку ещё раз."
+            )
+        return (
+            f"Нет доступа на редактирование. Откройте таблицу → Настройки доступа, добавьте {email} "
+            "с ролью «Редактор» и пришлите ссылку ещё раз."
+        )
+    return f"Google ответил {r.status_code}: {r.text[:150]}"
+
+
+def check_sheet(sa_json, sheet_id, email):
+    """Returns (title, None) if the sheet is readable and writable, else (None, error text)."""
+    try:
+        creds = service_account.Credentials.from_service_account_info(json.loads(sa_json), scopes=[SHEETS_SCOPE])
+        session = AuthorizedSession(creds)
+        r = session.get(f"{SHEETS_API}/{sheet_id}", params={"fields": "properties.title"}, timeout=15)
+        if not r.ok:
+            return None, sheet_error(r, email)
+        title = r.json()["properties"]["title"]
+        r = session.post(
+            f"{SHEETS_API}/{sheet_id}:batchUpdate",
+            json={
+                "requests": [
+                    {"updateSpreadsheetProperties": {"properties": {"title": title}, "fields": "title"}}
+                ]
+            },
+            timeout=15,
+        )
+        if not r.ok:
+            return None, sheet_error(r, email)
+        return title, None
+    except Exception as e:
+        return None, f"Не удалось проверить таблицу: {e}"
+
+
 def launch(chat_id):
     data = dict(state)
     reset()
+    extra_env = {"PUBLIC": "1" if data.get("public") else "0"}
+    if data.get("sheet_id"):
+        extra_env.update(GOOGLE_SA_JSON=data["sa_json"], SHEET_ID=data["sheet_id"])
     threading.Thread(
         target=new_bot,
         args=(
@@ -327,6 +413,7 @@ def launch(chat_id):
             data["gh_token"],
             data["render_key"],
             data["ai_key"],
+            extra_env,
         ),
         daemon=True,
     ).start()
@@ -362,38 +449,87 @@ def handle(chat_id, message_id, text):
         state["step"] = "ask"
         send(chat_id, "Что спросить у LLM?", CANCEL)
     elif step == "spec" and text:
-        state.update(step="bot_token", spec=text, spec_at=time.time())
+        state.update(step="audience", spec=text, spec_at=time.time())
         send(
             chat_id,
-            "Теперь токен бота: создайте нового в @BotFather и пришлите токен. "
-            "Сообщение с токеном я удалю.",
-            CANCEL,
+            "Кто будет общаться с ботом? «Всем» — бот отвечает любому, кто ему напишет "
+            "(например, клиентам). «Только мне» — только вам.",
+            AUDIENCE,
         )
-    elif step == "bot_token" and text:
-        token = text.strip()
-        if not TOKEN_RE.match(token) and time.time() - state["spec_at"] < CHUNK_WINDOW:
-            state["spec"] += "\n" + text
+    elif step == "audience" and text:
+        if text in (BTN_PRIVATE, BTN_PUBLIC):
+            state.update(step="integration", public=(text == BTN_PUBLIC))
+            send(
+                chat_id,
+                "С чем интегрировать бота? Сейчас в каталоге: 📊 Google Таблица "
+                "(запись имени, телефона и диалога клиента).",
+                INTEGRATIONS,
+            )
+        elif TOKEN_RE.match(text.strip()):
+            delete_message(chat_id, message_id)
+            send(chat_id, "Токен понадобится позже, я его удалил. Сначала выберите, кто будет общаться с ботом.", AUDIENCE)
+        elif time.time() - state["spec_at"] < CHUNK_WINDOW:
+            state["spec"] += "\n" + text  # Telegram splits long texts into several messages
             state["spec_at"] = time.time()
         else:
-            delete_message(chat_id, message_id)
-            username = check_bot_token(token)
-            if token == TOKEN:
-                send(chat_id, "Это токен самого meta-agent. Нужен токен нового бота из @BotFather.", CANCEL)
-            elif not username:
-                send(chat_id, "Telegram не принял токен. Проверьте и пришлите ещё раз.", CANCEL)
+            send(chat_id, "Выберите вариант кнопкой.", AUDIENCE)
+    elif step == "integration" and text:
+        if text == BTN_NOINT:
+            state["step"] = "bot_token"
+            send(chat_id, TOKEN_PROMPT, CANCEL)
+        elif text == BTN_SHEETS:
+            state["step"] = "sa_json"
+            send(chat_id, SHEETS_HELP, CANCEL)
+        else:
+            send(chat_id, "Такой интеграции пока нет в каталоге. Выберите кнопкой.", INTEGRATIONS)
+    elif step == "sa_json" and text:
+        delete_message(chat_id, message_id)
+        parsed = parse_sa(text)
+        if not parsed:
+            send(
+                chat_id,
+                "Не похоже на ключ сервисного аккаунта. Нужно всё содержимое JSON-файла "
+                "(в нём есть client_email и private_key). Пришлите ещё раз.",
+                CANCEL,
+            )
+        else:
+            sa_json, email = parsed
+            state.update(step="sheet", sa_json=sa_json, sa_email=email)
+            send(
+                chat_id,
+                f"Ключ принят. Создайте Google Таблицу, откройте Настройки доступа, добавьте {email} "
+                "с ролью «Редактор» и пришлите ссылку на таблицу.",
+                CANCEL,
+            )
+    elif step == "sheet" and text:
+        sheet_id = parse_sheet_id(text)
+        title, error = check_sheet(state["sa_json"], sheet_id, state["sa_email"])
+        if error:
+            send(chat_id, error, CANCEL)
+        else:
+            state.update(step="bot_token", sheet_id=sheet_id)
+            send(chat_id, f"Таблица «{title}» доступна для записи.\n\n" + TOKEN_PROMPT, CANCEL)
+    elif step == "bot_token" and text:
+        token = text.strip()
+        delete_message(chat_id, message_id)
+        username = check_bot_token(token)
+        if token == TOKEN:
+            send(chat_id, "Это токен самого meta-agent. Нужен токен нового бота из @BotFather.", CANCEL)
+        elif not username:
+            send(chat_id, "Telegram не принял токен. Проверьте и пришлите ещё раз.", CANCEL)
+        else:
+            state.update(bot_token=token, username=username)
+            if state.get("mode") == "own":
+                launch(chat_id)
             else:
-                state.update(bot_token=token, username=username)
-                if state.get("mode") == "own":
-                    launch(chat_id)
-                else:
-                    state["step"] = "gh_token"
-                    send(
-                        chat_id,
-                        f"@{username} принят. Теперь токен GitHub того аккаунта, куда положить код бота. "
-                        "Создать: github.com/settings/tokens?type=beta, доступ All repositories, "
-                        "права Contents и Administration: Read and write. Сообщение удалю.",
-                        CANCEL,
-                    )
+                state["step"] = "gh_token"
+                send(
+                    chat_id,
+                    f"@{username} принят. Теперь токен GitHub того аккаунта, куда положить код бота. "
+                    "Создать: github.com/settings/tokens?type=beta, доступ All repositories, "
+                    "права Contents и Administration: Read and write. Сообщение удалю.",
+                    CANCEL,
+                )
     elif step == "gh_token" and text:
         delete_message(chat_id, message_id)
         login = check_github(text.strip())
