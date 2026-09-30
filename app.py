@@ -49,13 +49,16 @@ set_webhook()
 BTN_OWN = "🙋 Бот для меня"
 BTN_NEW = "🤖 Создать бота"
 BTN_ASK = "💬 Спросить LLM"
+BTN_EDIT = "✏️ Изменить бота"
+BTN_APPLY = "✅ Применить"
 BTN_CANCEL = "Отмена"
 BTN_PRIVATE = "Только мне"
 BTN_PUBLIC = "Всем"
 BTN_SHEETS = "📊 Google Таблица"
 BTN_NOINT = "Без интеграций"
-MENU = [[BTN_OWN], [BTN_NEW], [BTN_ASK]]
+MENU = [[BTN_OWN], [BTN_NEW], [BTN_EDIT], [BTN_ASK]]
 CANCEL = [[BTN_CANCEL]]
+APPLY = [[BTN_APPLY], [BTN_CANCEL]]
 AUDIENCE = [[BTN_PRIVATE, BTN_PUBLIC], [BTN_CANCEL]]
 INTEGRATIONS = [[BTN_SHEETS], [BTN_NOINT], [BTN_CANCEL]]
 TOKEN_PROMPT = (
@@ -397,6 +400,74 @@ def check_sheet(sa_json, sheet_id, email):
         return None, f"Не удалось проверить таблицу: {e}"
 
 
+def edit_list(chat_id):
+    try:
+        bots = {}
+        services = checked(render_api(OWN_RENDER, "GET", "/services", params={"limit": 100}), "список сервисов")
+        for item in services:
+            svc = item.get("service") or item
+            repo = (svc.get("repo") or "").removeprefix("https://github.com/").removesuffix(".git")
+            if svc.get("type") != "web_service" or not repo:
+                continue
+            if gh(OWN_GH, "GET", f"/repos/{repo}/contents/prompt.txt").ok:
+                bots[svc["name"]] = {"repo": repo, "service_id": svc["id"]}
+        if not bots:
+            send(chat_id, "Ботов, созданных через meta-agent, в ваших аккаунтах не нашлось.", MENU)
+            return
+        state.update(step="edit_pick", bots=bots)
+        send(chat_id, "Какого бота изменить?", [[name] for name in bots] + CANCEL)
+    except Exception as e:
+        reset()
+        send(chat_id, f"ошибка: {e}", MENU)
+
+
+def edit_prepare(chat_id, target, change):
+    try:
+        f = checked(gh(OWN_GH, "GET", f"/repos/{target['repo']}/contents/prompt.txt"), "чтение prompt.txt")
+        current = base64.b64decode(f["content"]).decode("utf-8")
+        _, out = ask_llm(
+            "Вот системный промпт Telegram-бота:\n\n" + current
+            + "\n\nВнеси в него изменение: " + change
+            + "\n\nСохрани все остальные требования. Верни ТОЛЬКО полный обновлённый промпт, "
+            "без пояснений и без кавычек."
+        )
+        new = out.strip()
+        if new.startswith("```"):
+            new = new.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        if len(new) < 20:
+            raise RuntimeError("модель вернула пустой промпт")
+        state.update(step="edit_confirm", new_prompt=new, sha=f["sha"])
+        shown = new if len(new) <= 3300 else new[:3300] + "…\n(показано начало)"
+        send(chat_id, f"Новый промпт:\n\n{shown}\n\nПрименить?", APPLY)
+    except Exception as e:
+        reset()
+        send(chat_id, f"ошибка: {e}", MENU)
+
+
+def edit_apply(chat_id, data):
+    try:
+        target = data["target"]
+        checked(
+            gh(
+                OWN_GH,
+                "PUT",
+                f"/repos/{target['repo']}/contents/prompt.txt",
+                json={
+                    "message": "update prompt.txt",
+                    "content": base64.b64encode(data["new_prompt"].encode()).decode(),
+                    "sha": data["sha"],
+                },
+            ),
+            "запись prompt.txt",
+        )
+        send(chat_id, "Промпт сохранён в репозитории, запускаю деплой...")
+        deploy = checked(render_api(OWN_RENDER, "POST", f"/services/{target['service_id']}/deploys", json={}), "запуск деплоя")
+        status = wait_deploy(OWN_RENDER, {"service": {"id": target["service_id"]}, "deployId": deploy["id"]})
+        send(chat_id, f"Статус деплоя: {status}", MENU)
+    except Exception as e:
+        send(chat_id, f"ошибка: {e}", MENU)
+
+
 def launch(chat_id):
     data = dict(state)
     reset()
@@ -444,6 +515,18 @@ def handle(chat_id, message_id, text):
             "Бот в чужие аккаунты. Опишите ТЗ: что бот должен делать и как отвечать.\n\n" + RENDER_GH_NOTE,
             CANCEL,
         )
+    elif text == BTN_EDIT:
+        reset()
+        if not (OWN_GH and OWN_RENDER):
+            send(
+                chat_id,
+                "Для этого режима в env сервиса meta-agent нужны GITHUB_TOKEN и RENDER_API_KEY "
+                "(ваши). Добавьте их на Render и повторите.",
+                MENU,
+            )
+        else:
+            send(chat_id, "Ищу ваших ботов...", CANCEL)
+            threading.Thread(target=edit_list, args=(chat_id,), daemon=True).start()
     elif text == BTN_ASK:
         reset()
         state["step"] = "ask"
@@ -562,6 +645,20 @@ def handle(chat_id, message_id, text):
         else:
             state["ai_key"] = text.strip()
             launch(chat_id)
+    elif step == "edit_pick" and text:
+        if text in state["bots"]:
+            state.update(step="edit_request", target=state["bots"][text])
+            send(chat_id, f"Бот {text}. Что изменить или добавить в его поведении? Опишите словами.", CANCEL)
+        else:
+            send(chat_id, "Выберите бота кнопкой.", [[name] for name in state["bots"]] + CANCEL)
+    elif step == "edit_request" and text:
+        state["step"] = "edit_working"
+        send(chat_id, "Переписываю промпт...", CANCEL)
+        threading.Thread(target=edit_prepare, args=(chat_id, state["target"], text), daemon=True).start()
+    elif step == "edit_confirm" and text == BTN_APPLY:
+        data = dict(state)
+        reset()
+        threading.Thread(target=edit_apply, args=(chat_id, data), daemon=True).start()
     elif step == "ask" and text:
         reset()
         threading.Thread(target=answer, args=(chat_id, text), daemon=True).start()
