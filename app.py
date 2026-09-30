@@ -377,7 +377,9 @@ def handle(chat_id, message_id, text):
         else:
             delete_message(chat_id, message_id)
             username = check_bot_token(token)
-            if not username:
+            if token == TOKEN:
+                send(chat_id, "Это токен самого meta-agent. Нужен токен нового бота из @BotFather.", CANCEL)
+            elif not username:
                 send(chat_id, "Telegram не принял токен. Проверьте и пришлите ещё раз.", CANCEL)
             else:
                 state.update(bot_token=token, username=username)
