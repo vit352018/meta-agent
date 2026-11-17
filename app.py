@@ -51,6 +51,13 @@ BTN_NEW = "🤖 Создать бота"
 BTN_ASK = "💬 Спросить LLM"
 BTN_EDIT = "✏️ Изменить бота"
 BTN_APPLY = "✅ Применить"
+BTN_EDIT_PROMPT = "💬 Поведение (промпт)"
+BTN_EDIT_COLS = "📊 Колонки таблицы"
+BTN_OK = "✅ Верно"
+BTN_REDO = "🔁 Переписать"
+BTN_DEFAULT_COLS = "Стандартные колонки"
+BTN_RETRY = "🔁 Повторить"
+BTN_PUBLIC_RETRY = "🌐 Сделать репозиторий публичным и повторить"
 BTN_CANCEL = "Отмена"
 BTN_PRIVATE = "Только мне"
 BTN_PUBLIC = "Всем"
@@ -59,6 +66,15 @@ BTN_NOINT = "Без интеграций"
 MENU = [[BTN_OWN], [BTN_NEW], [BTN_EDIT], [BTN_ASK]]
 CANCEL = [[BTN_CANCEL]]
 APPLY = [[BTN_APPLY], [BTN_CANCEL]]
+EDIT_WHAT = [[BTN_EDIT_PROMPT], [BTN_EDIT_COLS], [BTN_CANCEL]]
+CONFIRM = [[BTN_OK], [BTN_REDO], [BTN_CANCEL]]
+RETRY = [[BTN_PUBLIC_RETRY], [BTN_RETRY], [BTN_CANCEL]]
+DEFAULT_COLUMNS = {"A": "дата", "B": "имя клиента", "C": "телефон", "D": "весь диалог"}
+COLUMNS_HELP = (
+    "Что записывать в таблицу и в какие колонки? Опишите как удобно, например: «H — имя клиента, "
+    "I — телефон, B — сегодняшняя дата, J — email, M — направление: Боты или Веб, L — боль клиента». "
+    "Данные записывает сам бот отдельным запросом, поэтому клиент их не увидит."
+)
 AUDIENCE = [[BTN_PRIVATE, BTN_PUBLIC], [BTN_CANCEL]]
 INTEGRATIONS = [[BTN_SHEETS], [BTN_NOINT], [BTN_CANCEL]]
 TOKEN_PROMPT = (
@@ -274,28 +290,79 @@ def new_bot(chat_id, spec, bot_token, username, gh_token, render_key, ai_key, ex
         with open(os.path.join(BASE_DIR, "requirements.txt"), encoding="utf-8") as f:
             push_file(gh_token, repo, "requirements.txt", f.read())
         push_file(gh_token, repo, "prompt.txt", prompt)
-        created = create_service(
-            render_key,
-            name,
-            repo,
-            {
-                "PYTHON_VERSION": "3.11.9",
-                "TELEGRAM_TOKEN": bot_token,
-                "OWNER_CHAT_ID": str(OWNER),
-                "WEBHOOK_SECRET": secrets.token_hex(16),
-                "AI_API_KEY": ai_key,
-                "AI_MODEL": AI_MODEL,
-                **extra_env,
-            },
+        env = {
+            "PYTHON_VERSION": "3.11.9",
+            "TELEGRAM_TOKEN": bot_token,
+            "OWNER_CHAT_ID": str(OWNER),
+            "WEBHOOK_SECRET": secrets.token_hex(16),
+            "AI_API_KEY": ai_key,
+            "AI_MODEL": AI_MODEL,
+            **extra_env,
+        }
+    except Exception as e:
+        send(chat_id, f"ошибка: {e}", MENU)
+        return
+    deploy_bot(chat_id, name, repo, username, render_key, env, gh_token)
+
+
+def make_public_and_deploy(chat_id, data):
+    try:
+        checked(
+            gh(data["gh_token"], "PATCH", f"/repos/{data['repo']}", json={"private": False}),
+            "смена видимости репозитория",
         )
+    except Exception as e:
+        send(chat_id, f"ошибка: {e}", RETRY)
+        state.update(step="retry", retry=data)
+        return
+    time.sleep(2)
+    deploy_bot(chat_id, data["name"], data["repo"], data["username"], data["render_key"], data["env"], data["gh_token"])
+
+
+def deploy_bot(chat_id, name, repo, username, render_key, env, gh_token):
+    """Creates the Render service and waits for the deploy. If Render cannot open the repository,
+    keeps everything in memory so the user can fix access and press "Повторить"."""
+    try:
+        try:
+            created = create_service(render_key, name, repo, env)
+        except RuntimeError as e:
+            if "unfetchable" not in str(e):
+                raise
+            login = repo.split("/")[0]
+            reset()
+            state.update(
+                step="retry",
+                retry={
+                    "name": name,
+                    "repo": repo,
+                    "username": username,
+                    "render_key": render_key,
+                    "env": env,
+                    "gh_token": gh_token,
+                },
+            )
+            send(
+                chat_id,
+                f"Репозиторий создан (https://github.com/{repo}), но Render не смог его открыть: "
+                f"он не подключён к GitHub-аккаунту {login} или не видит его приватные репозитории.\n\n"
+                "Вариант 1, быстрый: нажмите «🌐 Сделать репозиторий публичным и повторить». "
+                "Публичный репозиторий Render открывает без всяких подключений. Минус: код бота и его "
+                "промпт (инструкции) смогут увидеть все, у кого есть ссылка. Токены и ключи в репозитории "
+                "не хранятся, они лежат в настройках Render.\n\n"
+                f"Вариант 2, приватно: подключите Render к аккаунту {login} (на dashboard.render.com: "
+                "New → Web Service → вкладка GitHub → Connect, выберите этот аккаунт и «All repositories»), "
+                "затем нажмите «🔁 Повторить». Токены вводить заново не нужно.",
+                RETRY,
+            )
+            return
         send(chat_id, f"сервис {name} создан, жду деплой...")
         status = wait_deploy(render_key, created)
         report = (
             f"статус деплоя: {status}\nбот: @{username}\n"
             f"репо: https://github.com/{repo}\nсервис: {created['service']['serviceDetails']['url']}"
         )
-        if "SHEET_ID" in extra_env:
-            report += f"\nтаблица: https://docs.google.com/spreadsheets/d/{extra_env['SHEET_ID']}"
+        if "SHEET_ID" in env:
+            report += f"\nтаблица: https://docs.google.com/spreadsheets/d/{env['SHEET_ID']}"
         if status != "live":
             report += "\n\n" + RENDER_GH_NOTE
         send(chat_id, report, MENU)
@@ -468,12 +535,90 @@ def edit_apply(chat_id, data):
         send(chat_id, f"ошибка: {e}", MENU)
 
 
+def parse_columns(text):
+    _, out = ask_llm(
+        "Пользователь описал, какие данные записывать в какие колонки Google Таблицы. Верни ТОЛЬКО JSON "
+        'вида {"H": "что записывать", ...}: ключ это буква колонки заглавной латиницей, значение это '
+        "описание данных (сохрани уточнения и допустимые значения). Если в колонку нужно писать весь "
+        'диалог, опиши её как "весь диалог".\n\nОписание: ' + text
+    )
+    data = json.loads(out[out.index("{") : out.rindex("}") + 1])
+    cols = {}
+    for key, value in data.items():
+        key, value = str(key).strip().upper(), str(value).strip()
+        if re.fullmatch(r"[A-Z]{1,2}", key) and value:
+            cols[key] = value
+    if not cols:
+        raise ValueError("не нашёл ни одной колонки")
+    return dict(sorted(cols.items(), key=lambda kv: (len(kv[0]), kv[0])))
+
+
+def columns_prepare(chat_id, text):
+    try:
+        cols = parse_columns(text)
+        state.update(step="columns_confirm", columns=cols)
+        listing = "\n".join(f"{k} — {v}" for k, v in cols.items())
+        send(chat_id, f"Понял так:\n{listing}\n\nВерно?", CONFIRM)
+    except Exception as e:
+        print(f"parse_columns failed: {e}", flush=True)
+        state["step"] = "columns"
+        send(
+            chat_id,
+            "Не удалось разобрать описание: модель ответила не в нужном формате. "
+            "Опишите колонки ещё раз, можно короче и по одной на строку.",
+            CANCEL,
+        )
+
+
+def edit_cols_apply(chat_id, data):
+    try:
+        target = data["target"]
+        envs = checked(render_api(OWN_RENDER, "GET", f"/services/{target['service_id']}/env-vars"), "переменные сервиса")
+        if "SHEET_ID" not in {(e.get("envVar") or e)["key"] for e in envs}:
+            raise RuntimeError("у этого бота нет интеграции с таблицей")
+        with open(os.path.join(BASE_DIR, "bot_template.py"), encoding="utf-8") as f:
+            code = f.read()
+        current = checked(gh(OWN_GH, "GET", f"/repos/{target['repo']}/contents/app.py"), "чтение app.py")
+        checked(
+            gh(
+                OWN_GH,
+                "PUT",
+                f"/repos/{target['repo']}/contents/app.py",
+                json={
+                    "message": "update bot code and sheet columns",
+                    "content": base64.b64encode(code.encode()).decode(),
+                    "sha": current["sha"],
+                },
+            ),
+            "запись app.py",
+        )
+        checked(
+            render_api(
+                OWN_RENDER,
+                "PUT",
+                f"/services/{target['service_id']}/env-vars/SHEET_COLUMNS",
+                json={"value": json.dumps(data["columns"], ensure_ascii=False)},
+            ),
+            "запись SHEET_COLUMNS",
+        )
+        send(chat_id, "Код и колонки обновлены, запускаю деплой...")
+        deploy = checked(render_api(OWN_RENDER, "POST", f"/services/{target['service_id']}/deploys", json={}), "запуск деплоя")
+        status = wait_deploy(OWN_RENDER, {"service": {"id": target["service_id"]}, "deployId": deploy["id"]})
+        send(chat_id, f"Статус деплоя: {status}", MENU)
+    except Exception as e:
+        send(chat_id, f"ошибка: {e}", MENU)
+
+
 def launch(chat_id):
     data = dict(state)
     reset()
     extra_env = {"PUBLIC": "1" if data.get("public") else "0"}
     if data.get("sheet_id"):
-        extra_env.update(GOOGLE_SA_JSON=data["sa_json"], SHEET_ID=data["sheet_id"])
+        extra_env.update(
+            GOOGLE_SA_JSON=data["sa_json"],
+            SHEET_ID=data["sheet_id"],
+            SHEET_COLUMNS=json.dumps(data.get("columns") or DEFAULT_COLUMNS, ensure_ascii=False),
+        )
     threading.Thread(
         target=new_bot,
         args=(
@@ -590,8 +735,30 @@ def handle(chat_id, message_id, text):
         if error:
             send(chat_id, error, CANCEL)
         else:
-            state.update(step="bot_token", sheet_id=sheet_id)
-            send(chat_id, f"Таблица «{title}» доступна для записи.\n\n" + TOKEN_PROMPT, CANCEL)
+            state.update(step="columns", sheet_id=sheet_id, flow="new")
+            send(chat_id, f"Таблица «{title}» доступна для записи.\n\n" + COLUMNS_HELP, [[BTN_DEFAULT_COLS], [BTN_CANCEL]])
+    elif step == "columns" and text:
+        if text == BTN_DEFAULT_COLS and state.get("flow") == "new":
+            state.update(step="bot_token", columns=DEFAULT_COLUMNS)
+            send(chat_id, TOKEN_PROMPT, CANCEL)
+        else:
+            state["step"] = "columns_working"
+            send(chat_id, "Разбираю описание...", CANCEL)
+            threading.Thread(target=columns_prepare, args=(chat_id, text), daemon=True).start()
+    elif step == "columns_confirm" and text:
+        if text == BTN_OK and state.get("flow") == "edit":
+            data = dict(state)
+            reset()
+            threading.Thread(target=edit_cols_apply, args=(chat_id, data), daemon=True).start()
+        elif text == BTN_OK:
+            state["step"] = "bot_token"
+            send(chat_id, TOKEN_PROMPT, CANCEL)
+        elif text == BTN_REDO:
+            state["step"] = "columns"
+            keyboard = [[BTN_DEFAULT_COLS], [BTN_CANCEL]] if state.get("flow") == "new" else CANCEL
+            send(chat_id, "Опишите колонки заново.", keyboard)
+        else:
+            send(chat_id, "Нажмите кнопку.", CONFIRM)
     elif step == "bot_token" and text:
         token = text.strip()
         delete_message(chat_id, message_id)
@@ -647,10 +814,19 @@ def handle(chat_id, message_id, text):
             launch(chat_id)
     elif step == "edit_pick" and text:
         if text in state["bots"]:
-            state.update(step="edit_request", target=state["bots"][text])
-            send(chat_id, f"Бот {text}. Что изменить или добавить в его поведении? Опишите словами.", CANCEL)
+            state.update(step="edit_what", target=state["bots"][text])
+            send(chat_id, f"Бот {text}. Что изменить?", EDIT_WHAT)
         else:
             send(chat_id, "Выберите бота кнопкой.", [[name] for name in state["bots"]] + CANCEL)
+    elif step == "edit_what" and text:
+        if text == BTN_EDIT_PROMPT:
+            state["step"] = "edit_request"
+            send(chat_id, "Что изменить или добавить в поведении бота? Опишите словами.", CANCEL)
+        elif text == BTN_EDIT_COLS:
+            state.update(step="columns", flow="edit")
+            send(chat_id, COLUMNS_HELP, CANCEL)
+        else:
+            send(chat_id, "Выберите вариант кнопкой.", EDIT_WHAT)
     elif step == "edit_request" and text:
         state["step"] = "edit_working"
         send(chat_id, "Переписываю промпт...", CANCEL)
@@ -659,6 +835,31 @@ def handle(chat_id, message_id, text):
         data = dict(state)
         reset()
         threading.Thread(target=edit_apply, args=(chat_id, data), daemon=True).start()
+    elif step == "retry" and text:
+        if text == BTN_RETRY:
+            data = state["retry"]
+            reset()
+            send(chat_id, "Повторяю создание сервиса...", CANCEL)
+            threading.Thread(
+                target=deploy_bot,
+                args=(
+                    chat_id,
+                    data["name"],
+                    data["repo"],
+                    data["username"],
+                    data["render_key"],
+                    data["env"],
+                    data["gh_token"],
+                ),
+                daemon=True,
+            ).start()
+        elif text == BTN_PUBLIC_RETRY:
+            data = state["retry"]
+            reset()
+            send(chat_id, "Делаю репозиторий публичным и повторяю...", CANCEL)
+            threading.Thread(target=make_public_and_deploy, args=(chat_id, data), daemon=True).start()
+        else:
+            send(chat_id, "Выберите кнопку ниже.", RETRY)
     elif step == "ask" and text:
         reset()
         threading.Thread(target=answer, args=(chat_id, text), daemon=True).start()
